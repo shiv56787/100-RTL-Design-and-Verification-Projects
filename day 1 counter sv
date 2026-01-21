@@ -1,0 +1,274 @@
+// testbench.sv
+`timescale 1ns/1ns
+
+// Interface used by driver/monitor and DUT
+interface counter_if(input logic clk);
+  logic rst;
+  logic en;
+  logic valid;
+  logic [3:0] count; // sampled DUT output
+endinterface
+
+// ---------------------------
+// Transaction class
+// ---------------------------
+class counter_trans;
+  rand bit rst;
+  rand bit en;
+  int id;
+  bit [3:0] current_count;
+  bit [3:0] expected_next_count;
+  bit [3:0] actual_count;
+
+  // Constraint: bias en to 1 most of the time
+  constraint c_en {
+    en dist {1'b1 := 80, 1'b0 := 20};
+  }
+
+  // Covergroup (class-scope)
+  covergroup cg;
+    coverpoint rst {
+      bins rst_1 = {1};
+      bins rst_0 = {0};
+    }
+    coverpoint en {
+      bins en_1 = {1};
+      bins en_0 = {0};
+    }
+    cross rst, en;
+    coverpoint current_count iff (en && !rst) {
+      bins wrap = {4'hF};
+    }
+  endgroup
+
+  // Constructor
+  function new(int i = 0);
+    id = i;
+    cg = new(); // instantiate covergroup instance
+  endfunction
+
+  // Compute expected next count (golden model)
+  function void compute(bit [3:0] prev_count);
+    current_count = prev_count;
+    if (rst) begin
+      expected_next_count = 4'b0000;
+    end
+    else if (en) begin
+      expected_next_count = current_count + 1;
+    end
+    else begin
+      expected_next_count = current_count;
+    end
+    cg.sample(); // update coverage
+  endfunction
+
+  // Debug string
+  function string show();
+    return $sformatf("id=%0d rst=%0b en=%0b curr=%0h exp_next=%0h",
+                     id, rst, en, current_count, expected_next_count);
+  endfunction
+
+endclass
+
+// ---------------------------
+// Generator
+// ---------------------------
+class generator;
+  mailbox #(counter_trans) to_drv;
+  int N;
+  bit [3:0] current_count = 4'b0000;
+
+  function new(mailbox #(counter_trans) m, int n);
+    to_drv = m;
+    N = n;
+  endfunction
+
+  task run();
+    counter_trans t;
+    begin
+      for (int i = 0; i < N; i++) begin
+        t = new(i);
+        assert(t.randomize()) else $fatal(1, "randomize failed");
+        t.compute(current_count);
+        to_drv.put(t);
+        $display("[%0t] GEN = %s", $time, t.show());
+        current_count = t.expected_next_count;
+        #($urandom_range(1,3) * 10);
+      end
+      $display("[%0t] GEN DONE (%0d items)", $time, N);
+    end
+  endtask
+endclass
+
+// ---------------------------
+// Driver
+// ---------------------------
+class driver;
+  virtual counter_if vif;
+  mailbox #(counter_trans) gen2drv;
+  mailbox #(counter_trans) exp_mbox;
+  int sent = 0;
+
+  function new(virtual counter_if v, mailbox #(counter_trans) g, mailbox #(counter_trans) e);
+    begin
+      vif = v;
+      gen2drv = g;
+      exp_mbox = e;
+    end
+  endfunction
+
+  task run();
+    counter_trans t;
+    forever begin
+      gen2drv.get(t);
+
+      @(negedge vif.clk);
+      // Drive stimulus
+      vif.rst = t.rst;
+      vif.en  = t.en;
+      vif.valid = 1;
+
+      // send expected transaction to scoreboard
+      exp_mbox.put(t);
+      sent = sent + 1;
+
+      @(posedge vif.clk);
+      @(negedge vif.clk);
+      vif.valid = 0;
+      // Optionally deassert rst/en here if you want single-cycle pulses:
+      // vif.rst = 0; vif.en = 0;
+    end
+  endtask
+endclass
+
+// ---------------------------
+// Monitor (FIXED: sample after small delta to avoid race)
+// ---------------------------
+class monitor;
+  virtual counter_if vif;
+  mailbox #(counter_trans) act_mbox;
+
+  function new(virtual counter_if v, mailbox #(counter_trans) a);
+    begin
+      vif = v;
+      act_mbox = a;
+    end
+  endfunction
+
+  task run();
+    counter_trans t;
+    forever begin
+      @(posedge vif.clk);
+      if (vif.valid) begin
+        // small delta to avoid race with DUT update (DUT updates on posedge using non-blocking)
+        #1;
+        t = new(-1);
+        t.rst = vif.rst;
+        t.en  = vif.en;
+        t.actual_count = vif.count;
+        act_mbox.put(t);
+      end
+    end
+  endtask
+endclass
+
+// ---------------------------
+// Scoreboard
+// ---------------------------
+class scoreboard;
+  mailbox #(counter_trans) exp_mbox;
+  mailbox #(counter_trans) act_mbox;
+  int errors = 0;
+  int total = 0;
+
+  function new(mailbox #(counter_trans) e, mailbox #(counter_trans) a);
+    exp_mbox = e;
+    act_mbox = a;
+  endfunction
+
+  task run();
+    counter_trans ex, ac;
+    forever begin
+      exp_mbox.get(ex);
+      act_mbox.get(ac);
+      total = total + 1;
+
+      // ex already computed expected_next_count by generator (based on prev_count)
+      if (ex.expected_next_count !== ac.actual_count) begin
+        $display("[%0t][ERROR] id=%0d exp=%0h act=%0h", $time, ex.id, ex.expected_next_count, ac.actual_count);
+        errors = errors + 1;
+      end else begin
+        $display("[%0t][OK] id=%0d match %0h", $time, ex.id, ac.actual_count);
+      end
+    end
+  endtask
+
+  function void report();
+    $display("---- SCOREBOARD ----");
+    $display("total   = %0d", total);
+    $display("errors  = %0d", errors);
+    $display("result  = %s", (errors==0) ? "PASS" : "FAIL");
+    $display("---------------------");
+  endfunction
+endclass
+
+// ---------------------------
+// Top-level TB
+// ---------------------------
+module tb;
+  // clock
+  logic clk = 0;
+  always #5 clk = ~clk;
+
+  // interface instance
+  counter_if vif(clk);
+
+  // DUT instance (make sure design.sv defines module counter)
+  counter dut (
+    .clk(clk),
+    .rst(vif.rst),
+    .en(vif.en),
+    .count(vif.count)
+  );
+
+  // mailboxes
+  mailbox #(counter_trans) gen2drv = new();
+  mailbox #(counter_trans) exp_mbox  = new();
+  mailbox #(counter_trans) act_mbox  = new();
+
+  // components
+  generator gen = new(gen2drv, 40); // generate 40 transactions
+  driver drv = new(vif, gen2drv, exp_mbox);
+  monitor mon = new(vif, act_mbox);
+  scoreboard sb = new(exp_mbox, act_mbox);
+
+  initial begin
+    $dumpfile("counter.vcd");
+    $dumpvars(0, tb);
+  end
+
+  initial begin
+    // initialize interface signals
+    vif.rst = 1;
+    vif.en  = 0;
+    vif.valid = 0;
+    // release reset after a couple cycles
+    repeat (2) @(posedge clk);
+    vif.rst = 0;
+
+    // run components
+    fork
+      gen.run();
+      drv.run();
+      mon.run();
+      sb.run();
+    join_none
+
+    // wait until driver sends all transactions
+    wait (drv.sent == 40);
+    #100;
+    sb.report();
+    $finish;
+  end
+
+endmodule
