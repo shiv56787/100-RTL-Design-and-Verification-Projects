@@ -1,0 +1,210 @@
+interface tl_if (input logic clk);
+  logic rst;
+  logic red, yellow, green;
+  logic valid;
+  logic [31:0] tx_id;
+endinterface
+
+// --- Transaction Class ---
+class tl_trans;
+  int id;
+  logic exp_red, exp_yellow, exp_green;
+  logic act_red, act_yellow, act_green;
+  
+  function new(int i = -1);
+    id = i;
+  endfunction
+  
+  function string show();
+    return $sformatf("id = %0d exp(RYG)=%b%b%b act(RYG)=%b%b%b", 
+                     id, exp_red, exp_yellow, exp_green, act_red, act_yellow, act_green);
+  endfunction
+endclass
+
+// --- Generator ---
+class generator;
+  mailbox #(tl_trans) to_drv;
+  int N;
+  virtual tl_if vif;
+
+  function new (mailbox #(tl_trans) m, int n, virtual tl_if v);
+    to_drv = m; N = n; vif = v;
+  endfunction
+
+  task run();
+    tl_trans t;
+    wait (vif.rst == 0);
+    for (int i = 0; i < N; i++) begin
+      t = new(i);
+      to_drv.put(t);
+      $display("[%0t] GEN id=%0d", $time, t.id);
+      @(posedge vif.clk);
+    end
+  endtask
+endclass
+
+// --- Driver ---
+class driver;
+  virtual tl_if vif;
+  mailbox #(tl_trans) gen2drv;
+  mailbox #(tl_trans) exp_mbox;
+  int sent = 0;
+
+  function new (virtual tl_if v, mailbox #(tl_trans) g, mailbox #(tl_trans) e);
+    vif = v; gen2drv = g; exp_mbox = e;
+  endfunction
+
+  task run();
+    tl_trans t;
+    wait (vif.rst == 0);
+    forever begin
+      gen2drv.get(t);
+      @(negedge vif.clk);
+      vif.valid <= 1;
+      vif.tx_id <= t.id;
+      
+      // Sample current DUT state as expectation
+      t.exp_red    = vif.red;
+      t.exp_yellow = vif.yellow;
+      t.exp_green  = vif.green;
+      
+      exp_mbox.put(t);
+      sent++;
+      @(negedge vif.clk);
+      vif.valid <= 0;
+    end
+  endtask
+endclass
+
+// --- Monitor ---
+class monitor;
+  virtual tl_if vif;
+  mailbox #(tl_trans) act_mbox;
+
+  function new (virtual tl_if v, mailbox #(tl_trans) a);
+    vif = v; act_mbox = a;
+  endfunction
+
+  task run();
+    tl_trans t;
+    forever begin
+      @(posedge vif.clk);
+      if (vif.valid === 1) begin
+        t = new(vif.tx_id);
+        t.act_red    = vif.red;
+        t.act_yellow = vif.yellow;
+        t.act_green  = vif.green;
+        act_mbox.put(t);
+        $display("[%0t] MON id=%0d RYG=%b%b%b", $time, t.id, t.act_red, t.act_yellow, t.act_green);
+      end
+    end
+  endtask
+endclass
+
+// --- Scoreboard ---
+class scoreboard;
+  mailbox #(tl_trans) exp_mbox;
+  mailbox #(tl_trans) act_mbox;
+  int total = 0;
+  int errors = 0;
+  
+  function new (mailbox #(tl_trans) e, mailbox #(tl_trans) a);
+    exp_mbox = e; act_mbox = a;
+  endfunction
+  
+  task run ();
+    tl_trans ex, ac;
+    forever begin
+      exp_mbox.get(ex);
+      act_mbox.get(ac);
+      total++;
+      if(ex.exp_red !== ac.act_red || ex.exp_yellow !== ac.act_yellow || ex.exp_green !== ac.act_green) begin
+        errors++;
+        $display("[%0t] ERROR %s", $time, ex.show());
+      end else begin
+        $display("[%0t] PASS id=%0d", $time, ex.id);
+      end
+    end
+  endtask
+
+  function void report();
+    $display("\n------ SCOREBOARD ------");
+    $display("Total  = %0d", total);
+    $display("Errors = %0d", errors);
+    $display("Result = %s", (errors==0 && total > 0)?"PASS":"FAIL");
+  endfunction
+endclass
+
+// --- Top Module ---
+module tb;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  
+  tl_if vif(clk);
+  
+  traffic_light dut(
+    .clk(clk),
+    .rst(vif.rst),
+    .red(vif.red),
+    .yellow(vif.yellow),
+    .green(vif.green)
+  );
+  
+  mailbox #(tl_trans) gen2drv = new();
+  mailbox #(tl_trans) exp_mbox = new();
+  mailbox #(tl_trans) act_mbox = new();
+              
+  generator  gen = new(gen2drv, 9, vif);
+  driver     drv = new(vif, gen2drv, exp_mbox);
+  monitor    mon = new(vif, act_mbox);
+  scoreboard sb  = new(exp_mbox, act_mbox);
+
+  initial begin
+    vif.rst = 1;
+    vif.valid = 0;
+    #20 vif.rst = 0;
+  end
+
+  initial begin
+    fork
+      gen.run();
+      drv.run();
+      mon.run();
+      sb.run();
+    join_none
+
+    wait(sb.total == 9);
+    #10;
+    sb.report();
+    $finish;
+  end
+endmodule
+
+    // design 
+    module traffic_light (
+  input logic clk,
+  input logic rst,
+  output logic red,
+  output logic yellow,
+  output logic green
+);
+  typedef enum logic [1:0] {RED, GREEN, YELLOW} state_t;
+  state_t state, next;
+  
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst)
+      state <= RED;
+    else
+      state <= next;
+  end
+  
+  always_comb begin
+    red = 0; yellow = 0; green = 0;
+    case (state)
+      RED:    begin red = 1; next = GREEN; end
+      GREEN:  begin green = 1; next = YELLOW; end
+      YELLOW: begin yellow = 1; next = RED; end
+      default: next = RED;
+    endcase
+  end
+endmodule
