@@ -1,0 +1,189 @@
+module uart_tx #(parameter data_width = 8)(
+  input logic clk,
+  input logic rst,
+  input logic baud_tick,
+  input logic tx_start,
+  input logic [data_width - 1:0] data_in,
+  output logic tx,
+  output logic tx_done,
+  output logic tx_busy);
+
+  typedef enum logic [1:0] {
+    idle, start, data, stop} state_t;
+  state_t state, next_state;
+
+  logic [data_width-1:0] data_reg;
+  logic [$clog2(data_width)-1:0] bit_index;
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst)
+      state <= idle;
+    else
+      state <= next_state;
+  end
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst) begin
+      data_reg  <= 0;
+      bit_index <= 0;
+    end else begin
+      if(state == idle && tx_start) begin
+        data_reg  <= data_in;
+        bit_index <= 0;
+      end
+      else if (state == data && baud_tick) begin
+        bit_index <= bit_index + 1;
+      end
+    end
+  end
+
+  always_comb begin
+    next_state = state;
+    case(state)
+      idle: begin
+        if(tx_start)
+          next_state = start;
+      end
+      start: begin
+        if(baud_tick)
+          next_state = data;
+      end
+      data: begin
+        if(baud_tick && bit_index == data_width-1)
+          next_state = stop;
+      end
+      stop: begin
+        if(baud_tick)
+          next_state = idle;
+      end
+    endcase
+  end
+
+  always_comb begin
+    tx      = 1'b1;
+    tx_busy = 1'b0;
+    tx_done = 1'b0;
+    case(state)
+      idle: begin
+        tx      = 1'b1;
+        tx_busy = 1'b0;
+      end
+      start: begin
+        tx      = 1'b0;
+        tx_busy = 1'b1;
+      end
+      data: begin
+        tx      = data_reg[bit_index];
+        tx_busy = 1'b1;
+      end
+      stop: begin
+        tx      = 1'b1;
+        tx_busy = 1'b1;
+        if(baud_tick)
+          tx_done = 1'b1;
+      end
+    endcase
+  end
+
+endmodule
+
+
+module uart_rx #(parameter data_width = 8)(
+  input logic clk,
+  input logic rst,
+  input logic baud_tick,
+  input logic rx,
+  output logic [data_width-1:0] data_out,
+  output logic rx_done);
+
+  typedef enum logic [1:0] {
+    idle, start, data, stop} state_t;
+  state_t state, next_state;
+
+  logic [data_width-1:0] data_reg;
+  logic [$clog2(data_width)-1:0] bit_index;
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst) state <= idle;
+    else
+      state <= next_state;
+  end
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst) begin
+      data_reg  <= 0;
+      bit_index <= 0;
+    end
+    else begin
+      if(state == start && baud_tick) begin
+        bit_index <= 0;
+      end
+      else if (state == data && baud_tick) begin
+        data_reg[bit_index] <= rx;
+        bit_index           <= bit_index + 1;
+      end
+    end
+  end
+
+  always_comb begin
+    next_state = state;
+    case(state)
+      idle: begin
+        if(rx == 0)
+          next_state = start;
+      end
+      start: begin
+        if(baud_tick)
+          next_state = data;
+      end
+      data: begin
+        if(baud_tick && bit_index == data_width-1)
+          next_state = stop;
+      end
+      stop: begin
+        if(baud_tick)
+          next_state = idle;
+      end
+    endcase
+  end
+
+  always_comb begin
+    data_out = data_reg;
+    rx_done  = 1'b0;
+    case(state)
+      stop: begin
+        if(baud_tick)
+          rx_done = 1'b1;
+      end
+    endcase
+  end
+
+endmodule
+
+
+module baud_gen
+    #(parameter clks_per_bit = 5208)(
+  input  logic clk,
+  input  logic rst,
+  output logic tick
+);
+  logic [$clog2(clks_per_bit)-1:0] count;
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst) begin
+      count <= 0;
+      tick  <= 0;
+    end
+    else begin
+      if(count == clks_per_bit - 1) begin
+        count <= 0;
+        tick  <= 1;
+      end
+      else begin
+        count <= count + 1;
+        tick  <= 0;
+      end
+    end
+  end
+
+endmodule
