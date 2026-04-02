@@ -1,0 +1,518 @@
+
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+
+  parameter int DATA_WIDTH = 8;
+  parameter int FIFO_DEPTH = 16;
+
+module uart_tx #(parameter data_width = 8)(
+  input logic clk,
+  input logic rst,
+  input logic baud_tick,
+  input logic tx_start,
+  input logic [data_width - 1:0] data_in,
+  output logic tx,
+  output logic tx_done,
+  output logic tx_busy);
+
+  typedef enum logic [1:0] {
+    idle, start, data, stop} state_t;
+  state_t state, next_state;
+
+  logic [data_width-1:0] data_reg;
+  logic [$clog2(data_width)-1:0] bit_index;
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst)
+      state <= idle;
+    else
+      state <= next_state;
+  end
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst) begin
+      data_reg  <= 0;
+      bit_index <= 0;
+    end else begin
+      if(state == idle && tx_start) begin
+        data_reg  <= data_in;
+        bit_index <= 0;
+      end
+      else if (state == data && baud_tick) begin
+        if(bit_index < data_width-1)
+              bit_index <= bit_index + 1;
+      end
+    end
+  end
+
+  always_comb begin
+    next_state = state;
+    case(state)
+      idle: begin
+        if(tx_start)
+          next_state = start;
+      end
+      start: begin
+        if(baud_tick)
+          next_state = data;
+      end
+      data: begin
+        if(baud_tick && bit_index == data_width-1)
+          next_state = stop;
+      end
+      stop: begin
+        if(baud_tick)
+          next_state = idle;
+      end
+    endcase
+  end
+
+  always_comb begin
+    tx      = 1'b1;
+    tx_busy = 1'b0;
+    tx_done = 1'b0;
+    case(state)
+      idle: begin
+        tx      = 1'b1;
+        tx_busy = 1'b0;
+      end
+      start: begin
+        tx      = 1'b0;
+        tx_busy = 1'b1;
+      end
+      data: begin
+        tx      = data_reg[bit_index];
+        tx_busy = 1'b1;
+      end
+      stop: begin
+        tx      = 1'b1;
+        tx_busy = 1'b1;
+        if(baud_tick)
+          tx_done = 1'b1;
+      end
+    endcase
+  end
+
+endmodule
+
+
+module uart_rx #(parameter data_width = 8)(
+  input logic clk,
+  input logic rst,
+  input logic baud_tick,
+  input logic rx,
+  output logic [data_width-1:0] data_out,
+  output logic rx_done);
+
+  typedef enum logic [1:0] {
+    idle, start, data, stop} state_t;
+  state_t state, next_state;
+
+  logic [data_width-1:0] data_reg;
+  logic [$clog2(data_width)-1:0] bit_index;
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst) state <= idle;
+    else
+      state <= next_state;
+  end
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst) begin
+      data_reg  <= 0;
+      bit_index <= 0;
+    end
+    else begin
+      if(state == start && baud_tick) begin
+        bit_index <= 0;
+      end
+      else if (state == data && baud_tick) begin
+        data_reg[bit_index] <= rx;
+        if(bit_index < data_width-1)
+             bit_index <= bit_index + 1;
+      end
+    end
+  end
+
+  always_comb begin
+    next_state = state;
+    case(state)
+      idle: begin
+        if(rx == 0)
+          next_state = start;
+      end
+      start: begin
+        if(baud_tick)
+          next_state = data;
+      end
+      data: begin
+        if(baud_tick && bit_index == data_width-1)
+          next_state = stop;
+      end
+      stop: begin
+        if(baud_tick)
+          next_state = idle;
+      end
+    endcase
+  end
+
+  always_comb begin
+    data_out = data_reg;
+    rx_done  = 1'b0;
+    case(state)
+      stop: begin
+        if(baud_tick)
+          rx_done = 1'b1;
+      end
+    endcase
+  end
+
+endmodule
+
+
+module baud_gen
+    #(parameter clks_per_bit = 5208)(
+  input  logic clk,
+  input  logic rst,
+  output logic tick
+);
+  logic [$clog2(clks_per_bit)-1:0] count;
+
+  always_ff @(posedge clk or posedge rst) begin
+    if(rst) begin
+      count <= 0;
+      tick  <= 0;
+    end
+    else begin
+      if(count == clks_per_bit - 1) begin
+        count <= 0;
+        tick  <= 1;
+      end
+      else begin
+        count <= count + 1;
+        tick  <= 0;
+      end
+    end
+  end
+
+endmodule
+
+interface uart_if(input logic clk);
+  logic rst;
+  logic baud_tick;
+  logic [DATA_WIDTH-1:0] tx_data;
+  logic tx_start;
+  logic tx_done;
+  logic tx_busy;
+  logic tx;
+  logic [DATA_WIDTH-1:0] rx_data;
+  logic rx_done;
+
+  clocking drv_cb @(posedge clk);
+    output rst, baud_tick, tx_data, tx_start;
+    input  tx_done, tx_busy, tx, rx_data, rx_done;
+  endclocking
+
+  clocking mon_cb @(posedge clk);
+    input rst, baud_tick, tx_data, tx_start, tx_done, tx_busy, tx, rx_data, rx_done;
+  endclocking
+
+  modport DUT_mp (input rst, baud_tick, tx_data, tx_start, output tx_done, tx_busy, tx, rx_data, rx_done);
+  modport DRV_MP (clocking drv_cb);
+  modport MON_MP (clocking mon_cb);
+
+endinterface
+
+
+class trans extends uvm_sequence_item;
+  `uvm_object_utils(trans)
+
+  rand logic rst;
+  logic baud_tick;
+  rand logic [7:0] tx_data;
+  rand logic tx_start;
+  logic tx_done;
+  logic tx_busy;
+  logic tx;
+  logic [7:0] rx_data;
+  logic rx_done;
+  rand bit [7:0] data;
+
+endclass
+
+
+class seq_rst extends uvm_sequence#(trans);
+  `uvm_object_utils(seq_rst)  
+
+  function new(string name = "seq_rst");
+    super.new(name);
+  endfunction
+  task body();
+    req = trans::type_id::create("req");
+    start_item(req);
+    assert(req.randomize() with {rst == 1;tx_data == 8'h00; tx_start == 0;}) 
+    finish_item(req);
+  endtask
+endclass
+
+class seq extends uvm_sequence#(trans);
+  `uvm_object_utils(seq)  
+
+  function new(string name = "seq");
+    super.new(name);
+  endfunction
+  task body();
+    req = trans::type_id::create("req");
+    start_item(req);  
+    assert(req.randomize() with {rst == 0;tx_start == 1;})
+    finish_item(req); 
+  endtask
+endclass
+
+
+
+
+class seqr extends uvm_sequencer#(trans);
+  `uvm_component_utils(seqr)
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+endclass
+
+class drv extends uvm_driver#(trans);
+  `uvm_component_utils(drv)
+    virtual uart_if.DRV_MP vif;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if(!uvm_config_db#(virtual uart_if)::get(this, "", "vif", vif)) begin
+      `uvm_fatal("DRV", "Virtual interface not found")
+    end
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    forever begin 
+        seq_item_port.get_next_item(req);
+        drive();
+        seq_item_port.item_done();
+    end
+  endtask
+
+  task drive();
+
+    @(vif.drv_cb);
+    vif.drv_cb.rst       <= req.rst;
+    vif.drv_cb.tx_data   <= req.tx_data;
+    vif.drv_cb.tx_start  <= req.tx_start;
+
+     @(vif.drv_cb);
+         vif.drv_cb.tx_start  <= 0;
+
+  endtask
+
+endclass
+
+class mon extends uvm_monitor;
+  `uvm_component_utils(mon)
+
+  virtual uart_if.MON_MP vif;
+  uvm_analysis_port#(trans) mon_port;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    mon_port = new("mon_port", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if(!uvm_config_db#(virtual uart_if)::get(this, "", "vif", vif)) begin
+      `uvm_fatal("MON", "Virtual interface not found")
+    end
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    forever begin
+      while(vif.mon_cb.rx_done == 0)
+            @(vif.mon_cb);
+      collect();
+    end
+  endtask
+
+  task collect();
+    trans req;
+    req = trans::type_id::create("req");
+
+    req.rst       = vif.mon_cb.rst;
+    req.baud_tick = vif.mon_cb.baud_tick;
+    req.tx_data   = vif.mon_cb.tx_data;
+    req.tx_start  = vif.mon_cb.tx_start;
+    req.tx_done   = vif.mon_cb.tx_done;
+    req.tx_busy   = vif.mon_cb.tx_busy;
+    req.tx        = vif.mon_cb.tx;
+    req.rx_data   = vif.mon_cb.rx_data;
+    req.rx_done   = vif.mon_cb.rx_done;
+    mon_port.write(req);
+    @(vif.mon_cb);
+  endtask
+endclass
+
+
+class agent extends uvm_agent;
+  `uvm_component_utils(agent)
+  drv drvh;
+  mon monh;
+  seqr seqrh;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    drvh = drv::type_id::create("drvh", this);
+    monh = mon::type_id::create("monh", this);
+    seqrh = seqr::type_id::create("seqrh", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+    drvh.seq_item_port.connect(seqrh.seq_item_export);
+  endfunction
+
+endclass
+
+class sb extends uvm_scoreboard;
+  `uvm_component_utils(sb)
+  uvm_tlm_analysis_fifo#(trans) fifo_h;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    fifo_h = new("fifo_h", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    trans req;
+    forever begin
+      fifo_h.get(req);
+      if(req.rx_done) 
+      begin
+        if(req.tx_data != req.rx_data) 
+          `uvm_error("SB", $sformatf("Data mismatch: sent %h, received %h", req.tx_data, req.rx_data))
+         else 
+          $display("\n ************ Data match successful : sent %h |  received %h *********", req.tx_data, req.rx_data);
+      end
+    end
+  endtask
+
+
+endclass
+
+class env extends uvm_env;
+  `uvm_component_utils(env)
+  agent agenth;
+  sb sbh;
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    agenth = agent::type_id::create("agenth", this);
+    sbh = sb::type_id::create("sbh", this);
+  endfunction 
+
+  function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+    agenth.monh.mon_port.connect(sbh.fifo_h.analysis_export);
+
+  endfunction
+
+  
+endclass
+
+class test extends uvm_test;
+  `uvm_component_utils(test)
+    env envh;
+    
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+     envh = env::type_id::create("envh", this);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    seq_rst seq_rst_h;
+    seq seqh;
+    seq_rst_h = seq_rst::type_id::create("seq_rst_h");
+    seqh = seq::type_id::create("seqh");
+    repeat(10) begin
+    phase.raise_objection(this);
+    seq_rst_h.start(envh.agenth.seqrh);
+    seqh.start(envh.agenth.seqrh);
+    #600000;
+    phase.drop_objection(this);
+    end
+  endtask
+
+  function void end_of_elaboration_phase(uvm_phase phase);
+    super.end_of_elaboration_phase(phase);
+    uvm_top.print_topology();
+  endfunction
+
+endclass
+
+module top;
+
+  logic clk;
+  uart_if uart_if_inst(clk);
+
+  initial begin
+    clk = 0;
+    forever #5 clk = ~clk;
+  end
+
+  uart_tx #(.data_width(DATA_WIDTH)) uart_tx_inst(
+    .clk(clk),
+    .rst(uart_if_inst.rst),
+    .baud_tick(uart_if_inst.baud_tick),
+    .tx_start(uart_if_inst.tx_start),
+    .data_in(uart_if_inst.tx_data),
+    .tx(uart_if_inst.tx),
+    .tx_done(uart_if_inst.tx_done),
+    .tx_busy(uart_if_inst.tx_busy)
+  );
+
+  baud_gen baud_inst(
+  .clk(clk),
+  .rst(uart_if_inst.rst),
+  .tick(uart_if_inst.baud_tick)
+  );
+
+
+  uart_rx #(.data_width(DATA_WIDTH)) uart_rx_inst(
+  .clk(clk),
+  .rst(uart_if_inst.rst),
+  .baud_tick(uart_if_inst.baud_tick),
+  .rx(uart_if_inst.tx),
+  .data_out(uart_if_inst.rx_data),
+  .rx_done(uart_if_inst.rx_done)
+);
+
+  initial begin
+    uvm_config_db#(virtual uart_if)::set(null, "*", "vif", uart_if_inst);
+    run_test("test");
+  end
+
+endmodule
