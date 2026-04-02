@@ -1,0 +1,138 @@
+module tb;
+    logic clk = 0;
+    logic rst;
+    logic wr_en, rd_en;
+    logic [7:0] data_in;
+    logic [7:0] data_out;
+    logic full, empty;
+    
+    circular_buffer dut(
+        .clk(clk),
+        .rst(rst),
+        .wr_en(wr_en),
+        .rd_en(rd_en),
+        .data_in(data_in),
+        .data_out(data_out),
+        .full(full),
+        .empty(empty)
+    );
+    
+    // Clock
+    always #5 clk = ~clk;
+  initial begin
+    $dumpfile("dump.vcd");   // file name
+    $dumpvars(0, tb);        // dump all signals under tb
+end
+    
+    // -------------------------
+    // Assertions
+    // -------------------------
+    // No write when full
+    property p_no_write_full;
+        @(posedge clk) disable iff (rst)
+        full |-> !wr_en;
+    endproperty
+    assert property (p_no_write_full)
+        else $error("Write when FIFO full!");
+    
+    // No read when empty
+    property p_no_read_empty;
+        @(posedge clk) disable iff (rst)
+        empty |-> !rd_en;
+    endproperty
+    assert property (p_no_read_empty)
+        else $error("Read when FIFO empty!");
+    
+    // Count range check
+    property p_count_range;
+        @(posedge clk) disable iff (rst)
+        dut.count <= 4;
+    endproperty
+    assert property (p_count_range)
+        else $error("Count exceeded depth!");
+    
+    // -------------------------
+    // Functional Coverage
+    // -------------------------
+    covergroup fifo_cg @(posedge clk);
+        coverpoint wr_en;
+        coverpoint rd_en;
+        coverpoint dut.count {
+            bins empty_bin = {0};
+            bins full_bin  = {4};
+            bins mid_bin[] = {[1:3]};
+        }
+        cross wr_en, rd_en;
+    endgroup
+    fifo_cg cg = new();
+    
+    // -------------------------
+    // Simple Scoreboard
+    // -------------------------
+    byte queue[$];  // dynamic queue
+    byte expected_data;
+    logic check_data;
+    
+    // Track writes
+    always @(posedge clk) begin
+        if (rst) begin
+            queue = {};
+        end else begin
+            if (wr_en && !full)
+                queue.push_back(data_in);
+        end
+    end
+    
+    // Track reads - delay by one cycle to match RTL
+    always @(posedge clk) begin
+        if (rst) begin
+            check_data <= 0;
+        end else begin
+            if (rd_en && !empty) begin
+                check_data <= 1;
+                if (queue.size() > 0)
+                    expected_data <= queue.pop_front();
+            end else begin
+                check_data <= 0;
+            end
+        end
+    end
+    
+    // Check data on the cycle after read
+    always @(posedge clk) begin
+        if (check_data && !rst) begin
+            if (data_out !== expected_data)
+                $error("Data mismatch! Expected: %h, Got: %h", expected_data, data_out);
+        end
+    end
+    
+    // -------------------------
+    // Stimulus
+    // -------------------------
+    initial begin
+        rst = 1;
+        wr_en = 0;
+        rd_en = 0;
+        data_in = 0;
+        #10 rst = 0;
+        
+        // Write 4 values
+        repeat(4) begin
+            @(posedge clk);
+            wr_en = 1;
+            data_in = data_in + 8'h10;
+        end
+        @(posedge clk);
+        wr_en = 0;
+        
+        // Read 4 values
+        repeat(4) begin
+            @(posedge clk);
+            rd_en = 1;
+        end
+        @(posedge clk);
+        rd_en = 0;
+        
+        #20 $finish;
+    end
+endmodule
